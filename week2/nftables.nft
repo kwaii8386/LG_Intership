@@ -1,0 +1,364 @@
+#!/usr/sbin/nft -f
+#
+# ============================================================================
+#  FIREWALL RULESET — Test Firewall (Scapy / IPv6 / VLAN)
+#  Host      : raspberrypi4-64
+#  Test path : PC LG-Lab-PC-9 --[VLAN 5]--> Pi
+#
+#  PHIÊN BẢN NÀY: toàn bộ logic lọc L3/L4 đã chuyển từ hook `input`
+#                 sang hook `prerouting`.
+# ============================================================================
+#
+#  TOPOLOGY
+#  ---------------------------------------------------------------------------
+#    PC  enp1s0     192.168.69.165   2c:58:b9:8b:51:c2   fd53:1234:5678:5::11
+#    PC  enp1s0.5   -                2c:58:b9:8b:51:c2   fd53:1234:5678:5::12   <- VALID_SRC
+#    Pi  eth0       192.168.69.160   d8:3a:dd:a4:c0:75   -                      <- SSH quản trị
+#    Pi  eth0.5     -                d8:3a:dd:a4:c0:75   fd53:1234:5678:5::14   <- VALID_DST
+#
+#  TẠI SAO PREROUTING
+#  ---------------------------------------------------------------------------
+#    Hook `input` chỉ nhận gói có destination LOCAL. Gói mang dst không thuộc
+#    về Pi (TC-03) bị routing layer xử lý trước -> trả ICMPv6 unreachable,
+#    không bao giờ chạm `input`. Hook `prerouting` chạy TRƯỚC routing decision
+#    nên thấy được mọi gói đi vào, kể cả dst không hợp lệ.
+#
+#  PRIORITY
+#  ---------------------------------------------------------------------------
+#    netdev ingress   : -500   (VLAN / MAC — frame còn tag)
+#    prerouting       : -150   (mangle) — SAU conntrack (-200) nên `ct state`
+#                              dùng được. KHÔNG dùng `raw` (-300) vì ở đó
+#                              conntrack chưa chạy, mọi gói đều là `invalid`.
+#    input            : filter (0) — chỉ còn accept, logic đã lên prerouting
+#
+#  NGUYÊN TẮC
+#  ---------------------------------------------------------------------------
+#    1. Chỉ lọc chặt trên eth0.5. Interface khác accept sớm -> không mất SSH.
+#    2. VLAN/MAC lọc ở netdev trên eth0 (nơi frame còn tag).
+#    3. TCP flags kiểm tra TRƯỚC whitelist IP/port.
+#    4. Mọi rule đều có counter để đọc delta khi test.
+#
+#  QUY ƯỚC ĐẶT TÊN
+#  ---------------------------------------------------------------------------
+#    define        : UPPER_SNAKE_CASE
+#    table/chain   : lower_snake_case
+#    set           : lower_snake_case
+#    log prefix    : "FW_<LAYER>_<REASON>: "
+#    thứ tự rule   : <match> counter log prefix "..." <verdict>
+#
+#  VẬN HÀNH
+#  ---------------------------------------------------------------------------
+#    nft -c -f nftables.nft                     # kiểm tra cú pháp
+#    nft -f nftables.nft                        # apply
+#    nft list ruleset -a                        # xem counter
+#    nft reset counters                         # zero trước mỗi test case
+#    journalctl -kf | grep FW_                  # theo dõi log
+# ============================================================================
+
+flush ruleset
+
+# ============================================================================
+#  ĐỊNH NGHĨA BIẾN
+# ============================================================================
+
+# --- Interface ---
+define IF_LOOPBACK      = "lo"
+define IF_PHYSICAL      = "eth0"                    # frame CÒN VLAN tag
+define IF_TEST          = "eth0.5"                  # gói ĐÃ bóc VLAN tag
+define IF_WIRELESS      = "wlan0"
+
+# --- VLAN ---
+define VLAN_ID_VALID    = 5
+
+# --- Quản trị ---
+define MGMT_NET_IPV4    = 192.168.69.0/24
+
+# --- MAC ---
+define MAC_SRC_VALID    = 2c:58:b9:8b:51:c2
+
+# --- IPv6 unicast ---
+define IPV6_SRC_VALID_A = fd53:1234:5678:5::11
+define IPV6_SRC_VALID_B = fd53:1234:5678:5::12
+define IPV6_DST_VALID   = fd53:1234:5678:5::14
+
+# --- IPv6 multicast ---
+define IPV6_MCAST_VALID   = ff02::1
+define IPV6_MCAST_INVALID = ff00::1
+
+# --- Port ---
+define PORT_SRC_VALID   = 65535
+define PORT_DST_VALID   = 80
+
+# ============================================================================
+#  TABLE: fw_l2  —  LAYER 2 (VLAN / MAC / EtherType)
+#  Hook trên IF_PHYSICAL vì tại IF_TEST kernel đã bóc VLAN tag,
+#  biểu thức `vlan id` sẽ không bao giờ match.
+# ============================================================================
+
+table netdev fw_l2 {
+
+    set mac_src_whitelist {
+        type ether_addr
+        elements = { $MAC_SRC_VALID }
+    }
+
+    chain ingress_filter {
+        type filter hook ingress device $IF_PHYSICAL priority -500; policy accept;
+
+        # --- Bảo vệ SSH: IPv4 quản trị bỏ qua tầng này ---------------------
+        ip saddr $MGMT_NET_IPV4 \
+            counter accept
+
+        ether type { arp, ip } \
+            counter accept
+
+        # --- TC-12: IPv6 untagged (thiếu 802.1Q) ---------------------------
+        ether type ip6 \
+            counter log prefix "FW_L2_UNTAGGED: " drop
+
+        # --- Từ đây chỉ còn frame mang VLAN tag ----------------------------
+
+        # --- TC-11: VLAN ID sai --------------------------------------------
+        ether type vlan vlan id != $VLAN_ID_VALID \
+            counter log prefix "FW_L2_BAD_VLAN: " drop
+
+        # --- TC-13: MAC nguồn không hợp lệ ---------------------------------
+        ether saddr != @mac_src_whitelist ether type vlan \
+            counter log prefix "FW_L2_BAD_MAC: " drop
+
+        counter accept
+    }
+}
+
+# ============================================================================
+#  TABLE: fw_l3  —  LAYER 3/4 (IPv6 / TCP / UDP / ICMPv6)
+#  Toàn bộ logic nằm ở chain prerouting_filter.
+# ============================================================================
+
+table inet fw_l3 {
+
+    # ------------------------------------------------------------------------
+    #  SETS
+    # ------------------------------------------------------------------------
+
+    set ipv6_src_whitelist {
+        type ipv6_addr
+        elements = {
+            $IPV6_SRC_VALID_A,
+            $IPV6_SRC_VALID_B
+        }
+    }
+
+    set ipv6_dst_whitelist {
+        type ipv6_addr
+        elements = {
+            $IPV6_DST_VALID
+        }
+    }
+
+    set l4proto_whitelist {
+        type inet_proto
+        elements = { tcp, udp, icmpv6 }
+    }
+
+    set icmpv6_ndp_types {
+        type icmpv6_type
+        elements = {
+            nd-neighbor-solicit,
+            nd-neighbor-advert,
+            nd-router-solicit,
+            nd-router-advert
+        }
+    }
+
+    set icmpv6_echo_types {
+        type icmpv6_type
+        elements = { echo-request, echo-reply }
+    }
+
+    # ------------------------------------------------------------------------
+    #  CHAIN PHỤ — LOG & DROP
+    # ------------------------------------------------------------------------
+
+    chain drop_invalid_ipv6 {
+        counter log prefix "FW_L3_INVALID_IPV6: " flags all
+        drop
+    }
+
+    chain drop_bad_tcp_flags {
+        counter log prefix "FW_L3_BAD_TCP_FLAGS: " flags all
+        drop
+    }
+
+    # ------------------------------------------------------------------------
+    #  CHAIN CHÍNH — PREROUTING
+    #  priority mangle (-150): sau conntrack (-200), trước routing decision.
+    #  Nhờ vậy gói có dst KHÔNG local (TC-03) vẫn bị chặn tại đây.
+    # ------------------------------------------------------------------------
+
+    chain prerouting_filter {
+        type filter hook prerouting priority mangle; policy drop;
+
+        # ====================================================================
+        #  A. GIỮ KẾT NỐI QUẢN TRỊ  (luôn đặt đầu tiên)
+        #     prerouting không thấy traffic từ `lo` do host tự sinh, nhưng
+        #     giữ rule cho đủ và an toàn.
+        # ====================================================================
+        iif $IF_LOOPBACK \
+            counter accept
+
+        iif $IF_PHYSICAL \
+            counter accept
+
+        iif $IF_WIRELESS \
+            counter accept
+
+        # Từ đây trở xuống CHỈ áp dụng cho IF_TEST
+        iif != $IF_TEST \
+            counter accept
+
+        # ====================================================================
+        #  B. RULE NỀN
+        # ====================================================================
+        ct state established,related \
+            counter accept
+
+        ct state invalid \
+            counter log prefix "FW_L3_CT_INVALID: " drop
+
+        # NDP bắt buộc — thiếu thì Pi không phân giải được MAC của PC
+        icmpv6 type @icmpv6_ndp_types ip6 hoplimit 255 \
+            counter accept
+
+        # ====================================================================
+        #  C. LỌC PROTOCOL          (TC-15)
+        # ====================================================================
+        meta l4proto != @l4proto_whitelist \
+            counter jump drop_invalid_ipv6
+
+        # ====================================================================
+        #  D. TCP FLAGS BẤT THƯỜNG  (TC-16, TC-17a..17l)
+        #     Đặt TRƯỚC whitelist IP/port, nếu không gói SYN+FIN mang
+        #     IP/port hợp lệ sẽ bị accept nhầm.
+        # ====================================================================
+
+        # TC-16  : NULL scan
+        tcp flags & (fin|syn|rst|psh|ack|urg) == 0x0 \
+            counter jump drop_bad_tcp_flags
+
+        # TC-17a / 17g / 17h : SYN + FIN
+        tcp flags & (syn|fin) == (syn|fin) \
+            counter jump drop_bad_tcp_flags
+
+        # TC-17b : SYN + RST
+        tcp flags & (syn|rst) == (syn|rst) \
+            counter jump drop_bad_tcp_flags
+
+        # TC-17c : FIN + RST
+        tcp flags & (fin|rst) == (fin|rst) \
+            counter jump drop_bad_tcp_flags
+
+        # TC-17d : FIN đơn độc (không kèm ACK)
+        tcp flags & (fin|ack) == fin \
+            counter jump drop_bad_tcp_flags
+
+        # TC-17e : XMAS scan (FIN + PSH + URG)
+        tcp flags & (fin|psh|urg) == (fin|psh|urg) \
+            counter jump drop_bad_tcp_flags
+
+        # TC-17f : ALL flags
+        tcp flags & (fin|syn|rst|psh|ack|urg) == (fin|syn|rst|psh|ack|urg) \
+            counter jump drop_bad_tcp_flags
+
+        # TC-17i : URG đơn độc
+        tcp flags & (fin|syn|rst|psh|ack|urg) == urg \
+            counter jump drop_bad_tcp_flags
+
+        # TC-17j : PSH + URG (không SYN/ACK)
+        tcp flags & (psh|urg|syn|ack) == (psh|urg) \
+            counter jump drop_bad_tcp_flags
+
+        # TC-17k : SYN + ACK unsolicited
+        #          (ct established đã accept ở mục B -> tới đây là giả mạo)
+        tcp flags & (syn|ack) == (syn|ack) \
+            counter jump drop_bad_tcp_flags
+
+        # TC-17l : FIN + ACK unsolicited
+        tcp flags & (fin|ack) == (fin|ack) \
+            counter jump drop_bad_tcp_flags
+
+        # ====================================================================
+        #  E. MULTICAST             (TC-04, TC-05)
+        #     Đặt TRƯỚC rule ICMPv6 echo, nếu không ping ff00::1 sẽ lọt.
+        # ====================================================================
+
+        # TC-05 : multicast không hợp lệ -> DROP
+        ip6 daddr $IPV6_MCAST_INVALID \
+            counter jump drop_invalid_ipv6
+
+        # TC-04 : multicast all-nodes -> ACCEPT
+        ip6 daddr $IPV6_MCAST_VALID \
+            counter accept
+
+        # ====================================================================
+        #  F. ICMPv6 ECHO           (TC-14)
+        # ====================================================================
+        ip6 saddr @ipv6_src_whitelist \
+        ip6 daddr @ipv6_dst_whitelist \
+        icmpv6 type @icmpv6_echo_types \
+            counter accept
+
+        # ====================================================================
+        #  G. WHITELIST TCP / UDP   (TC-01, TC-08, TC-17m, TC-18)
+        # ====================================================================
+
+        # TCP hợp lệ
+        ip6 saddr @ipv6_src_whitelist \
+        ip6 daddr @ipv6_dst_whitelist \
+        tcp sport $PORT_SRC_VALID \
+        tcp dport $PORT_DST_VALID \
+            counter accept
+
+        # UDP hợp lệ
+        ip6 saddr @ipv6_src_whitelist \
+        ip6 daddr @ipv6_dst_whitelist \
+        udp sport $PORT_SRC_VALID \
+        udp dport $PORT_DST_VALID \
+            counter accept
+
+        # ====================================================================
+        #  H. CATCH-ALL
+        #     TC-02 (sai src) / TC-03 (sai dst — ĐÂY LÀ CHỖ GIỜ MỚI BẮT ĐƯỢC)
+        #     TC-06, TC-07 (sai TCP port) / TC-09, TC-10 (sai UDP port)
+        # ====================================================================
+        counter jump drop_invalid_ipv6
+    }
+
+    # ------------------------------------------------------------------------
+    #  CHAIN INPUT — chỉ còn đếm.
+    #  Gói tới được đây nghĩa là đã qua prerouting_filter.
+    #  Giữ lại để đọc counter, phân biệt "qua prerouting" vs "tới local".
+    # ------------------------------------------------------------------------
+
+    chain input_filter {
+        type filter hook input priority filter; policy accept;
+
+        counter
+    }
+
+    # ------------------------------------------------------------------------
+    #  CHAIN FORWARD / OUTPUT
+    # ------------------------------------------------------------------------
+
+    chain forward_filter {
+        type filter hook forward priority filter; policy drop;
+
+        counter log prefix "FW_L3_FORWARD_DROP: " drop
+    }
+
+    chain output_filter {
+        type filter hook output priority filter; policy accept;
+
+        counter
+    }
+}
